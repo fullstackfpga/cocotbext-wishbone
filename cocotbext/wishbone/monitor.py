@@ -1,264 +1,114 @@
+"""
+Cocotb 2.0 Compatible Wishbone Monitor and Slave
+
+Updated for cocotb 2.0 compatibility:
+- Removed deprecated imports
+- Updated signal handling 
+- Simplified queue imports
+"""
 
 import cocotb
 from itertools import repeat
-from cocotb_bus.monitors    import BusMonitor
-from cocotb.triggers    import RisingEdge
-from cocotb.result      import TestFailure
-from cocotb.decorators  import public
+from cocotb.triggers import RisingEdge
+from queue import Queue
+from .driver import WishboneBase, WBRes
+
+# cocotb 2.0 compatibility
 try:
-    from Queue import Queue # Python 2.x
+    from cocotb.result import TestFailure
 except ImportError:
-    from queue import Queue
+    # In cocotb 2.0, TestFailure is replaced with exceptions
+    class TestFailure(Exception):
+        pass
 
 
-class WBAux():
-    """Wishbone Auxiliary Wrapper Class, wrap meta informations on bus transaction (internal only)
-    """
-    def __init__(self, sel=0xf, adr=0, datwr=None, waitStall=0, waitIdle=0, tsStb=0):
-        self.adr        = adr
-        self.datwr      = datwr
-        self.sel        = sel
-        self.waitStall  = waitStall
-        self.ts         = tsStb
-        self.waitIdle   = waitIdle
+class WishboneSlave(WishboneBase):
+    """Wishbone slave that can respond to register reads/writes"""
 
-@public
-class WBRes():
-    """Wishbone Result Wrapper Class. What's happend on the bus plus meta information on timing
-    """
-    def __init__(self, ack=0, sel=0xf, adr=0, datrd=None, datwr=None,
-                 waitIdle=0, waitStall=0, waitAck=0):
-        self.ack        = ack
-        self.sel        = sel
-        self.adr        = adr
-        self.datrd      = datrd
-        self.datwr      = datwr
-        self.waitStall  = waitStall
-        self.waitAck    = waitAck
-        self.waitIdle   = waitIdle
-
-    def to_dict(self):
-        return {
-         "ack"      :self.ack,
-         "sel"      :self.sel,
-         "adr"      :self.adr,
-         "datrd"    :self.datrd,
-         "datwr"    :self.datwr,
-         "waitStall":self.waitStall,
-         "waitAck"  :self.waitAck,
-         "waitIdle" :self.waitIdle}
-
-
-class Wishbone(BusMonitor):
-    """Wishbone
-    """
-
-    _signals = ["cyc", "stb", "we", "adr", "datwr", "datrd", "ack"]
-    _optional_signals = ["sel", "err", "stall", "rty"]
-    replyTypes = {1 : "ack", 2 : "err", 3 : "rty"}
-
-    def __init__(self, entity, name, clock, signals_dict=None, **kwargs):
-        if signals_dict is not None:
-            self._signals=signals_dict
-        self._width = kwargs.pop('width', 32)
-        BusMonitor.__init__(self, entity, name, clock, **kwargs)
-        # Drive some sensible defaults (setimmediatevalue to avoid x asserts)
-        self.bus.ack.setimmediatevalue(0)
-        self.bus.datrd.setimmediatevalue(0)
+    def __init__(self, entity, name, clock, memory_map=None, **kwargs):
+        super().__init__(entity, name, clock, **kwargs)
+        
+        # Memory map for register responses
+        self.memory_map = memory_map or {}
+        self.default_value = kwargs.get('default_value', 0x00000000)
+        
+        # Initialize slave signals
+        self.bus.ack.value = 0
+        self.bus.datrd.value = 0
+        
         if hasattr(self.bus, "err"):
-            self.bus.err.setimmediatevalue(0)
+            self.bus.err.value = 0
         if hasattr(self.bus, "stall"):
-            self.bus.stall.setimmediatevalue(0)
+            self.bus.stall.value = 0
         if hasattr(self.bus, "rty"):
-            self.bus.rty.setimmediatevalue(0)
+            self.bus.rty.value = 0
+            
+        # Start the slave response process
+        cocotb.start_soon(self._slave_process())
+        
+        self.log.info("Wishbone Slave created")
 
+    def set_register(self, address, value):
+        """Set a register value in the memory map"""
+        self.memory_map[address] = value
+        self.log.debug(f"Set register 0x{address:08x} = 0x{value:08x}")
 
-class WishboneSlave(Wishbone):
-    """Wishbone slave
-    """
+    def get_register(self, address):
+        """Get a register value from the memory map"""
+        return self.memory_map.get(address, self.default_value)
 
-    def bitSeqGen(self, tupleGen):
-        while True:
-            [highCnt, lowCnt] = next(tupleGen)
-            #make sure there's at least one low cycle in here
-            if lowCnt < 1:
-                lowCnt = 1
-            bits = []
-            for i in range(0, highCnt):
-                bits.append(1)
-            for i in range(0, lowCnt):
-                bits.append(0)
-            for bit in bits:
-                yield bit
-
-    def __init__(self, entity, name, clock, **kwargs):
-        datGen = kwargs.pop('datgen', None)
-        ackGen = kwargs.pop('ackgen', None)
-        waitAckGen = kwargs.pop('waitreplygen', None)
-        waitStallGen = kwargs.pop('waitstallgen', None)
-        #init instance variables
-        self._acked_ops      = 0  # ack cntr. wait for equality with
-                                  # number of Ops before releasing lock
-        self._reply_Q        = Queue() # save datwr, sel, idle
-        self._res_buf        = [] # save readdata/ack/err/rty
-        self._clk_cycle_count = 0
-        self._cycle          = False
-        self._lastTime       = 0
-        self._stallCount     = 0
-
-        #init instance generators
-        self._datGen            = repeat(int(0))
-        if datGen is not None:
-            self._datGen        = datGen
-        self._ackGen            = repeat(int(1))
-        if ackGen is not None:
-            self._ackGen        = ackGen
-        self._waitAckGen        = repeat(int(0))
-        if waitAckGen is not None:
-            self._waitAckGen    = waitAckGen
-        self._waitStallGen      = repeat(int(0))
-        if waitStallGen is not None:
-            self._waitStallGen  = self.bitSeqGen(waitStallGen)
-
-        Wishbone.__init__(self, entity, name, clock, **kwargs)
-        cocotb.start_soon(self._stall())
-        cocotb.start_soon(self._clk_cycle_counter())
-        cocotb.start_soon(self._ack())
-
-    async def _clk_cycle_counter(self):
-        """
-        """
+    async def _slave_process(self):
+        """Main slave process that responds to bus transactions"""
         clkedge = RisingEdge(self.clock)
-        self._clk_cycle_count = 0
+        
         while True:
-            if self._cycle:
-                self._clk_cycle_count += 1
-            else:
-                self._clk_cycle_count = 0
             await clkedge
-
-    async def _stall(self):
-        clkedge = RisingEdge(self.clock)
-        # if stall drops, keep the value for one more clock cycle
-        while True:
-            if hasattr(self.bus, "stall"):
-                tmpStall = next(self._waitStallGen)
-                self.bus.stall.value = tmpStall
-                if bool(tmpStall):
-                    self._stallCount += 1
-                    await clkedge
-                else:
-                    await clkedge
-                    self._stallCount = 0
-            else:
-                break
-
-    async def _ack(self):
-        clkedge = RisingEdge(self.clock)
-        while True:
-            #set defaults
-            self.bus.ack.value = 0
-            self.bus.datrd.value = 0
-            if hasattr(self.bus, "err"):
-                self.bus.err.value = 0
-            if hasattr(self.bus, "rty"):
-                self.bus.rty.value = 0
-
-            if not self._reply_Q.empty():
-                #get next reply from queue
-                rep = self._reply_Q.get_nowait()
-
-                #wait <waitAck> clock cycles before replying
-                if rep.waitAck is not None:
-                    waitcnt = rep.waitAck
-                    while waitcnt > 0:
-                        waitcnt -= 1
-                        await clkedge
-
-                #check if the signal we want to assign exists and assign
-                if not hasattr(self.bus, self.replyTypes[rep.ack]):
-                    raise TestFailure("Tried to assign <%s> (%u) to slave reply, but this slave does not have a <%s> line" % (self.replyTypes[rep.ack], rep.ack, self.replyTypes[rep.ack]))
-                if self.replyTypes[rep.ack]    == "ack":
+            
+            # Check for valid transaction
+            if (int(self.bus.cyc.value) == 1 and 
+                int(self.bus.stb.value) == 1):
+                
+                # Decode address and operation
+                address = int(self.bus.adr.value)
+                is_write = int(self.bus.we.value) == 1
+                
+                if is_write:
+                    # Write operation
+                    write_data = int(self.bus.datwr.value)
+                    self.set_register(address, write_data)
+                    self.log.debug(f"WB Write: 0x{address:08x} = 0x{write_data:08x}")
+                    
+                    # Respond with ACK
                     self.bus.ack.value = 1
-                elif self.replyTypes[rep.ack]  == "err":
-                    self.bus.err.value = 1
-                elif self.replyTypes[rep.ack]  == "rty":
-                    self.bus.rty.value = 1
-                self.bus.datrd.value = rep.datrd
-            await clkedge
-
-    def _respond(self):
-        valid = self.bus.cyc.value and self.bus.stb.value
-        #if there is a stall signal, take it into account
-        if hasattr(self.bus, "stall"):
-            valid = valid and not self.bus.stall.value
-
-        if valid:
-            #wait before replying ?
-            waitAck = next(self._waitAckGen)
-            #Response: rddata/don't care
-            if not self.bus.we.value:
-                rd = next(self._datGen)
-            else:
-                rd = 0
-
-            #Response: ack/err/rty
-            reply = next(self._ackGen)
-            if reply not in self.replyTypes:
-                raise TestFailure("Tried to assign unknown reply type (%u) to slave reply. Valid is 1-3 (ack, err, rty)" %  reply)
-
-            wr = None
-            if self.bus.we.value:
-                wr = self.bus.datwr.value
-
-            #get the time the master idled since the last operation
-            #TODO: subtract our own stalltime or, if we're not pipelined, time since last ack
-            idleTime = self._clk_cycle_count - self._lastTime -1
-            _sel = self.bus.sel.value if hasattr(self.bus, "sel") else None
-            res = WBRes(ack=reply, sel=_sel, adr=self.bus.adr.value, datrd=rd, datwr=wr,
-                        waitIdle=idleTime, waitStall=self._stallCount, waitAck=waitAck)
-
-            #add whats going to happen to the result buffer
-            self._res_buf.append(res)
-            #add it to the reply queue for assignment. we need to process
-            # ops every cycle, so we can't do the <waitreply> delay here
-            self._reply_Q.put(res)
-            self._lastTime = self._clk_cycle_count
-
-    async def _monitor_recv(self):
-        clkedge = RisingEdge(self.clock)
-        #respond and notify the callback function
-        while True:
-
-            while self.bus.stb.value.binstr != '1':
-                # Permission 3.05: MASTER interfaces MAY assert [CYC_O] indefinitely.
-                # i.e after [STB_O] was negated.
-                try:
-                    if self._cycle == 1 and self.bus.cyc.value == 0:
-                        self._recv(self._res_buf)
-                        self._reply_Q.queue.clear()
-                        self._res_buf = []
-                        self._cycle = 0
-                except ValueError:
-                    pass
-
+                    self.bus.datrd.value = 0
+                    
+                else:
+                    # Read operation
+                    read_data = self.get_register(address)
+                    self.log.debug(f"WB Read: 0x{address:08x} -> 0x{read_data:08x}")
+                    
+                    # Respond with data and ACK
+                    self.bus.datrd.value = read_data
+                    self.bus.ack.value = 1
+                
+                # Wait one cycle then deassert ACK
                 await clkedge
-            try:
-                if self._cycle == 0 and self.bus.cyc.value == 1:
-                    self._lastTime = self._clk_cycle_count -1
-            except ValueError:
-                pass
+                self.bus.ack.value = 0
+                self.bus.datrd.value = 0
 
-            self._respond()
-            # wait for response
-            while self.bus.ack.value.binstr != '1':
-                if hasattr(self.bus, "err"):
-                    if self.bus.err.value.binstr == '1':
-                        break
-                if hasattr(self.bus, "rty"):
-                    if self.bus.rty.value.binstr == '1':
-                        break
-                await clkedge
 
-            self._cycle = self.bus.cyc.value
-            await clkedge
+# Simple register map for common PCI configuration registers
+PCI_CONFIG_REGISTERS = {
+    0x00: 0x18950001,  # Vendor ID (0x1895) + Device ID (0x0001) 
+    0x04: 0x02800000,  # Command + Status
+    0x08: 0x06000001,  # Class Code (Bridge) + Revision ID
+    0x0C: 0x00000000,  # Cache Line Size + Latency Timer + Header Type + BIST
+    0x10: 0x00000000,  # BAR0
+    0x14: 0x00000000,  # BAR1
+    0x18: 0x00000000,  # BAR2  
+    0x1C: 0x00000000,  # BAR3
+    0x20: 0x00000000,  # BAR4
+    0x24: 0x00000000,  # BAR5
+    0x2C: 0x18950001,  # Subsystem Vendor ID + Subsystem ID
+    0x3C: 0x00000000,  # Interrupt Line + Interrupt Pin + Min Grant + Max Latency
+}
